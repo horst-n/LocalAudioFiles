@@ -1,4 +1,4 @@
-#LocalAudioFiles# - ###MP3-DB###
+#LocalAudioFiles - MP3-DB#
 
 ###A ProcessWire (2.3.0+) Siteprofile###
 
