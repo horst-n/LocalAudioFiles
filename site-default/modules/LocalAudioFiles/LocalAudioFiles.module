@@ -1,0 +1,436 @@
+<?php
+/********************************************************************************************
+* @script_type -  PHP ProcessWire Module LocalAudioFiles
+* -------------------------------------------------------------------------
+* @author      -  Horst Nogajski <coding@nogajski.de>
+* @copyright   -  (c) 2002 - 2013
+* -------------------------------------------------------------------------
+* $Source: /WEB/pw_LAF/htdocs/site/modules/LocalAudioFiles/LocalAudioFiles.module,v $
+* $Id: LocalAudioFiles.module,v 1.9 2013/05/19 19:59:48 horst Exp $
+*********************************************************************************************/
+
+/**
+ * ProcessWire LocalAudioFiles
+ *
+ * LocalAudioFiles provides an admin page to let you scan your
+ * filesystem for Audiofiles (mp3) and manage them into a DB
+ *
+**/
+class LocalAudioFiles extends Process {
+
+	const pageName = 'LocalAudioFiles';
+
+	public $conf;
+
+	private $view;
+	private $validConfigKeys = array('pathes','filetypes','encodingCharset','lastModified','cacheDisabled','httpHost');
+	private $validConfigKeyArrays = array('pathes','filetypes');
+	private $validAudioFileExtensions = array('mp3','MP3');
+
+
+	static public function getModuleInfo() {
+		return array(
+			'title'    => self::pageName,
+			'summary'  => "LocalAudioFiles :: first Test with MP3's",
+			'version'  => 014,
+			'singular' => true,   // ??
+			'author'   => 'horst'
+		);
+	}
+
+	/**
+	 * Method to initialize the module.
+	 *
+	 * While the method is required, if you don't need it, then just leave the implementation blank.
+	 *
+	 * This is called after ProcessWire's API is fully ready for use and hooks. It is called at the end of the
+	 * bootstrap process. This is before PW has started retrieving or rendering a page. If you need to have the
+	 * API ready with the $page ready as well, then see the ready() method below this one.
+	 *
+	 */
+	public function init() {
+		parent::init();
+		$this->view = new TemplateFile(dirname(__FILE__).'/view.php');
+		$this->view->result = '';
+		$this->conf = wire('pages')->get('template=LocalAudioFilesConfig, name=lafc');
+	}
+
+
+	/**
+	 * Method called when API is fully ready and the $page is determined and set, but before a page is rendered.
+	 *
+	 * Optional and only called if it exists in the module.
+	 *
+	public function ready();
+	 */
+
+
+	/**
+	 * Execute this Process and return the output
+	 *
+	 * @return string
+	 *
+	 */
+	public function ___execute() {
+		// is needed for the ShellScript!
+		$host = (wire("config")->https ? 'https://' : 'http://') . wire("config")->httpHost;
+		$this->setConfig('httpHost',$host,false);
+
+		// check permission
+        if(!wire('user')->hasRole('localaudiofiles_admin|superuser')) {
+        	throw new WireException($this->_("You don't have access to LocalAudioFiles-Administration"));
+		}
+
+		// check input post for Pathes & FileTypes
+		if(wire('input')->post->submitFormConfig) {
+			$this->processFormConfig();
+		}
+
+		// check input post for FileSystemScan
+		if(wire('input')->post->submitFormSystemscan) {
+			$this->processFormSystemscan();
+		}
+
+		// check input post for CacheDrop
+		if(wire('input')->post->submitFormCacheDrop) {
+			$this->processFormCacheRebuild(true);
+		}
+
+		// check input post for CacheRebuild
+		if(wire('input')->post->submitFormCacheRebuild) {
+			$this->processFormCacheRebuild();
+		}
+
+		// render Form to set Pathes and Filetypes
+		//$this->renderInputFormConfig($this->getConfig('pathes'),$this->getConfig('filetypes'),$this->getConfig('encodingCharset'),$this->getConfig('cacheDisabled'));
+		$this->renderInputFormConfig($this->getConfig('pathes'),$this->getConfig('filetypes'),$this->getConfig('cacheDisabled'));
+
+		// render Form for CacheDrop
+		$this->renderInputFormCacheDrop();
+
+		// render Form for CacheRebuild
+		$this->renderInputFormCacheRebuild();
+
+		// render Form for FilesystemScan
+		$this->renderInputFormSystemscan();
+
+		// display Timestamp of last DB-update and a link for a detailed view
+        $this->view->dbInfo = "<p>Last DB-Update: ".date('Y-m-d - H:i:s', intval($this->getConfig('lastModified')))."</p>";
+
+		// bring the view to screen
+		return $this->view->render();
+	}
+
+
+	public function setConfig($key, $value, $sendUserMessage=false) {
+		if(!in_array($key,$this->validConfigKeys)) return;
+		if(in_array($key,$this->validConfigKeyArrays)) {
+			$ret = $this->conf->set('LAFC_'.$key, serialize($value));
+		} else {
+			$ret = $this->conf->set('LAFC_'.$key, $value);
+		}
+		$this->conf->save();
+		if($sendUserMessage===true) {
+			$this->message(sprintf($this->_("successful saved Configdata for key: %s"),$key));
+		}
+		return $ret;
+	}
+
+	public function getConfig($key) {
+		if(!in_array($key,$this->validConfigKeys)) return;
+		if(in_array($key,$this->validConfigKeyArrays)) {
+			return unserialize($this->conf->getUnformatted('LAFC_'.$key));
+		} else {
+			return $this->conf->getUnformatted('LAFC_'.$key);
+		}
+	}
+
+	public function getValidConfigKeys() {
+		return $this->validConfigKeys;
+	}
+
+    public function setLastModified($timestamp, $sendUserMessage=false) {
+		return $this->setConfig('lastModified',$timestamp,$sendUserMessage);
+    }
+
+	public function localAudioFilesFrontend($lafPage) {
+		@require_once(dirname(__FILE__).'/localAudioFilesFrontend.class.php');
+		if(!class_exists('localAudioFilesFrontendClass')) {
+			$this->error(sprintf($this->_("cannot load phpclass: %s - ( %s aborted! )"), 'localAudioFilesFrontendClass',__FUNCTION__));
+			return;
+		}
+		return new localAudioFilesFrontendClass($lafPage);
+	}
+
+
+	public function processFormConfig($pathes=null,$filetypes=null,$encodingCharset=null,$cacheDisabled=null) {
+	 // get set cacheDisabled
+	 	$cd = $cacheDisabled===null ? intval(trim(wire('input')->post->cacheDisabled)) : $cacheDisabled;
+		$cd = empty($cd) ? 0 : 1;
+		$this->setConfig('cacheDisabled',$cd,true);
+	 // get set encodingCharset
+//		$ec = $encodingCharset===null ? trim(wire('input')->post->encodingCharset) : $encodingCharset;
+//		$ec = empty($ec) || !is_string($ec) ? 'UTF-8' : $ec;
+//		// store encodingCharset or reset it with empty data if no valid dir is given
+//		$this->setConfig('encodingCharset',$ec,true);
+	 // get list of directories ( if pathes is null we are in HTTP-mode and have postdata, if we have pass direct data (array) we will work on command line )
+		$a = $pathes===null ? explode("\n", str_replace("\r\n", "\n", trim(wire('input')->post->pathes))) : $pathes;
+		$valid = $fails = array();
+		foreach($a as $d) {
+			$d = trim($d);
+			if($d=='') continue;
+			if(is_dir($d)) {
+				$valid[] = $d;
+			} else {
+				$fails[] = $d;
+			}
+		}
+		// store valid dirs into db as serialized array or reset it with empty data if no valid dir is given
+		$this->setConfig('pathes',$valid,true);
+		// throw Errormessage for invalid dirs
+		if(count($fails)>0) {
+        	$msg = count($fails)===1 ? $this->_("1 Path you have submitted is not valid!<br> - ") : sprintf($this->_("%s Pathes you have submitted are not valid!<br> - "),count($fails)) . nl2br(htmlentities(implode("\n - ",$fails), ENT_QUOTES, 'utf8'));
+        	$this->error($msg);
+		}
+	 // get list of filetypes ( if filetypes is null we are in HTTP-mode and have postdata, if we have pass direct data (array) we will work on command line )
+		$a = $filetypes===null ? explode(",", trim(wire('input')->post->filetypes)) : $filetypes;
+		$valid = $fails = array();
+		foreach($a as $d) {
+			$d = trim($d);
+			if($d=='') continue;
+			if(in_array($d,$this->validAudioFileExtensions)) {
+				$valid[] = $d;
+			} else {
+				$fails[] = $d;
+			}
+		}
+		// store valid extensions into db as serialized array or reset with an empty array if no valid ext is given
+		$this->setConfig('filetypes',$valid,true);
+	}
+
+	private function processFormSystemscan() {
+		@require_once(dirname(__FILE__).'/phpclasses/hn_mp3.class.php');
+		if(!class_exists('hn_dir')) {
+			$this->error(sprintf($this->_("cannot load phpclass: %s - ( %s aborted! )"), 'hn_dir_PWshell',__FUNCTION__));
+			return;
+		}
+		$Pathes = $this->getConfig('pathes');
+		$Filetypes = $this->getConfig('filetypes');
+		$init = array(
+			'debugoutput'		=> DBG_LOG_NONE,
+			'debugpattern'      => '/parseDir|timer/',
+			'depth'             => -1,
+			'fileextensions'    => $Filetypes,
+			'checksum'          => false,
+			'very_basic_result' => true,
+			'use_timer'         => true
+		);
+		$dir = new hn_dir_PWshell($init);
+		$summary = $dir->getDir( $Pathes );
+		$total = $dir->totalfilesize;
+        $this->message(sprintf($this->_("The FileSystemScan found %s valid Audiofiles with a total of %s."), strval(count($dir->files)), $dir->friendly_filesize($total)) . $summary);
+	}
+
+	private function processFormCacheRebuild($onlyDrop=false) {
+		$this->emptyCache(true);
+        $this->message($this->_("The cache is dropped now!"));
+        if(true===$onlyDrop) return;
+        $this->rebuildCache(true);
+        $this->message($this->_("The cache is rebuild now!"));
+	}
+
+	private function renderInputFormCacheRebuild() {
+		// create a new form field (also field wrapper)
+		$form = wire('modules')->get("InputfieldForm");
+		$form->action = "./";
+		$form->method = "post";
+		$form->attr("id+name",'LAFC_Form_CacheRebuild');
+		$form->attr("style",'display:inline;float:left;');
+		// oh only a submit button!
+		$submit = wire('modules')->get("InputfieldSubmit");
+		$submit->attr("value","perform CacheRebuild");
+		$submit->attr("id+name","submitFormCacheRebuild");
+		$form->append($submit);
+	    // render form without processing
+		$this->view->inputFormCacheRebuild = $form->render();
+	}
+
+	private function renderInputFormCacheDrop() {
+		// create a new form field (also field wrapper)
+		$form = wire('modules')->get("InputfieldForm");
+		$form->action = "./";
+		$form->method = "post";
+		$form->attr("id+name",'LAFC_Form_CacheDrop');
+		$form->attr("style",'display:inline;float:left;');
+		// oh only a submit button!
+		$submit = wire('modules')->get("InputfieldSubmit");
+		$submit->attr("value","only drop the Cache");
+		$submit->attr("id+name","submitFormCacheDrop");
+		$form->append($submit);
+	    // render form without processing
+		$this->view->inputFormCacheDrop = $form->render();
+	}
+
+	private function renderInputFormSystemscan() {
+		$Pathes = $this->getConfig('pathes');
+		$Filetypes = $this->getConfig('filetypes');
+		if(!is_array($Pathes) || count($Pathes)==0 || !is_array($Filetypes) || count($Filetypes)==0) {
+			$this->view->inputFormSystemscan = '<p><strong>Please setup the Rootdirectory and Fileextension for your Audiofiles!</strong></p>';
+			return;
+		}
+		// create a new form field (also field wrapper)
+		$form = wire('modules')->get("InputfieldForm");
+		$form->action = "./";
+		$form->method = "post";
+		$form->attr("id+name",'LAFC_Form_Systemscan');
+		// oh only a submit button!
+		$submit = wire('modules')->get("InputfieldSubmit");
+		$submit->attr("value","perform a FileSystemScan");
+		$submit->attr("id+name","submitFormSystemscan");
+		$form->append($submit);
+	    // render form without processing
+		$this->view->inputFormSystemscan = $form->render();
+	}
+
+	//private function renderInputFormConfig($Pathes='',$Filetypes='',$EncodingCharset='UTF-8',$CacheDisabled=false) {
+	private function renderInputFormConfig($Pathes='',$Filetypes='',$CacheDisabled=false) {
+		$Pathes = is_array($Pathes) ? implode("\n",$Pathes) : $Pathes;
+		$Filetypes = is_array($Filetypes) ? implode(',',$Filetypes) : $Filetypes;
+		// create a new form field (also field wrapper)
+		$form = wire('modules')->get("InputfieldForm");
+		$form->action = "./";
+		$form->method = "post";
+		$form->attr("id+name",'LAFC_Form_Pathes');
+		// create a textarea input for pathes
+		$field = wire('modules')->get("InputfieldTextarea");
+		$field->label = $this->_("define RootDirectory Path(es) to your audiofiles, one per Line");
+		$field->attr('id+name','pathes');
+		$field->required = 1;
+		$field->value = $Pathes;
+		$form->append($field); // append the field to the form
+		// create a text input for filetypes
+		$field = wire('modules')->get("InputfieldText");
+		$field->label = $this->_("define file extensions of your audiofiles, comma separated like: mp3,MP3, ... | currently allowed filetypes are: " .implode(',',$this->validAudioFileExtensions) );
+		$field->attr('id+name','filetypes');
+		$field->required = 1;
+		$field->value = $Filetypes;
+		$form->append($field); // append the field to the form
+		// create a text input for encodingCharset
+//		$field = wire('modules')->get("InputfieldText");
+//		$field->label = $this->_("define the EncodingCharset of your audiofiles ID3-Tags, if you know it. - Default is UTF-8 - (but it also can be ISO-8859-1 or another Charset)");
+//		$field->attr('id+name','encodingCharset');
+//		$field->required = 1;
+//		$field->value = $EncodingCharset;
+//		$form->append($field); // append the field to the form
+		// create a checkbox input for cacheDisabled
+		$field = wire('modules')->get("InputfieldCheckbox");
+		$field->label = $this->_("disable Caching for Menu and DB-Infos");
+		$field->attr('id+name','cacheDisabled');
+		$field->attr("value",'1');
+		$field->attr('checked', $CacheDisabled ? 'checked' : '');
+		$form->append($field); // append the field to the form
+		// oh a submit button!
+		$submit = wire('modules')->get("InputfieldSubmit");
+		$submit->attr("value","save Config");
+		$submit->attr("id+name","submitFormConfig");
+		$form->append($submit);
+	    // render form without processing
+		$this->view->inputFormConfig = $form->render();
+	}
+
+	public function emptyCache($directLogResponse=false) {
+		$fe = $this->localAudioFilesFrontend(wire('pages')->get('template=GENRES'));
+		$path = wire('config')->paths->cache;
+		$prefix = str_replace($path,'',$fe->cacheRoot);
+		$log = "--- empty Cache:\n";
+        $d = dir($path);
+		while (false !== ($entry = $d->read())) {
+			if(substr($entry,0,strlen($prefix))==$prefix) {
+				$res = @unlink($path.$entry) ? 'OK':'FAILED';
+				$line = " - deleting ".htmlentities($entry)." = $res\n";
+				$log .= $line;
+				if(true===$directLogResponse) {
+					if('admin'==wire('page')->template) {
+        				$this->message(sprintf($this->_(" - deleting cachefile %s = %s."), htmlentities($entry), $res));
+					}
+					else {
+						echo $line;
+					}
+				}
+			}
+		}
+		$d->close();
+		return $log;
+	}
+
+	public function rebuildCache($directLogResponse=false) {
+		$log = $this->emptyCache($directLogResponse);
+		$log .= "--- rebuild Cache:\n";
+		$fe = $this->localAudioFilesFrontend(wire('pages')->get('template=GENRES'));
+		$a = array('dbGetInfoGenres','dbGetInfoArtists','dbGetInfoAlbums','dbGetInfoBitrates','dbGetFullTreeAsUlList');
+		foreach($a as $method) {
+			$line = " - rebuild cache for $method, ...\n";
+			$log .= $line;
+			if(true===$directLogResponse) {
+				if('admin'==wire('page')->template) {
+        			$this->message(sprintf($this->_(" - rebuild cache for %s, ..."), $method));
+				}
+				else {
+					echo $line;
+				}
+			}
+			$fe->$method();
+		}
+		return $log;
+	}
+
+	public function ___install() {
+		// create the page our module will be assigned to
+		$page = new Page();
+		$page->template = 'admin';
+		$page->name = self::pageName;
+		$page->title = self::pageName;
+		$page->process = $this;
+		// installs to the admin "Setup" menu
+		$page->parent = $this->pages->get($this->config->adminRootPageID)->child('name=setup');
+		// check if the page already exists (--> throw an exception if it does)
+		$existingPage = $page->parent->child("name={$page->name}, include=all");
+		if($existingPage->id) {
+			$this->error(sprintf($this->_("There is already a page at %s - maybe a previous installation?"), $existingPage->path));
+			throw new WireException($this->_("Page already exists"));
+		}
+		$page->save();
+		//		// now create a childpage for our configdata
+		//		$childpage = new Page();
+		//		$childpage->template = 'LocalAudioFilesConfig';
+		//		$childpage->name = strtolower(self::pageName .'Config'. $this->modules->getModuleID($this));
+		//		$childpage->title = self::pageName .'Config';
+		//		$childpage->parent = $page;
+		//		$childpage->save();
+		// tell the user we created this page
+		$this->message(sprintf($this->_("Created page: %s - check it out!"), $page->path));
+	}
+
+	public function ___uninstall() {
+		$moduleID = $this->modules->getModuleID($this);
+		//		$childpage = wire('pages')->get('template=LocalAudioFilesConfig, name='. strtolower(self::pageName .'Config'. $moduleID));
+		//		if($childpage->id) {
+		//			$this->message(sprintf($this->_("Delete page: %s"), $childpage->path));
+		//			$childpage->delete();
+		//		}
+		$page = $this->pages->get("template=admin, process=$moduleID, name=" . self::pageName);
+		if($page->id) {
+			//			$childpage = $page->child;
+			//			if($childpage->id) {
+			//				$this->error(sprintf($this->_("Error delete page: %s"), $childpage->path));
+			//				$this->error($this->_("Module uninstal aborted!"));
+			//				return;
+			//			}
+			$this->message(sprintf($this->_("Delete page: %s"), $page->path));
+			$page->delete();
+		}
+	}
+
+}
+
+
